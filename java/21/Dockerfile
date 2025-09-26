@@ -20,7 +20,7 @@
 # SOFTWARE.
 #
 
-FROM --platform=$TARGETOS/$TARGETARCH eclipse-temurin:21-jdk
+FROM --platform=$TARGETOS/$TARGETARCH eclipse-temurin:25-jdk
 
 LABEL author="Collin Ilgner" maintainer="cohohohn04@gmail.com"
 
