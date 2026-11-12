@@ -23,7 +23,7 @@
         "ghcr.io\/coho04\/pterodactyl-docker-images:java_21": "ghcr.io\/coho04\/pterodactyl-docker-images:java_21"
     },
     "file_denylist": [],
-    "startup": "mkdir -p \/home\/container\/repo;\r\ncd \/home\/container\/repo;\r\nif [ -n \"$USERNAME\" ] && [ -n \"$ACCESS_TOKEN\" ] && [ -n \"$GITHUB_REPO_URL\" ]; then\r\n    GITHUB_REPO_URL=\"https:\/\/$USERNAME:$ACCESS_TOKEN@${GITHUB_REPO_URL#https:\/\/}\";\r\n    echo -e \"[SETUP] Cloning the repository\";\r\n    git clone -b \"$BRANCH\" \"$GITHUB_REPO_URL\" \/home\/container\/repo;\r\nelse\r\n    echo -e \"[ERROR] Missing GitHub credentials or repository URL\";\r\n    exit 1;\r\nfi;\r\n\r\nif [ -f pom.xml ]; then\r\n    echo -e \"[SETUP] Building with Maven\";\r\n    mvn clean package -Dfile.encoding=UTF-8;\r\n    echo -e \"[SETUP] Copying JAR file to \/home\/container\/\";\r\n    cp \/home\/container\/repo\/target\/$RUN_FILE \/home\/container\/$RUN_FILE;\r\n    cd .. && rm -rf \/home\/container\/repo;\r\nelse\r\n    echo -e \"[ERROR] No valid pom.xml file found for Maven build\";\r\n    exit 1;\r\nfi;\r\njava -Dterminal.jline=false -Dterminal.ansi=true -jar \/home\/container\/$RUN_FILE 2>&1 | tee logs\/latest.log",
+    "startup": "cd \/home\/container || exit 1;\nmkdir -p logs;\nREPO_DIR=\/home\/container\/repo;\nKEY=\/home\/container\/.ssh\/deploy_key;\nBR=\"${BRANCH:-main}\";\nMODE=\"${GIT_AUTH:-auto}\";\nif [[ \"$GITHUB_REPO_URL\" =~ ^git@([^:]+):(.+)$ ]]; then\n    GHOST=\"${BASH_REMATCH[1]}\"; GPATH=\"${BASH_REMATCH[2]}\";\nelif [[ \"$GITHUB_REPO_URL\" =~ ^https?:\/\/([^@\/]+@)?([^\/]+)\/(.+)$ ]]; then\n    GHOST=\"${BASH_REMATCH[2]}\"; GPATH=\"${BASH_REMATCH[3]}\";\nelse\n    echo -e \"[ERROR] GITHUB_REPO_URL must look like https:\/\/host\/owner\/repo or git@host:owner\/repo\"; exit 1;\nfi;\nGPATH=\"${GPATH%\/}\"; GPATH=\"${GPATH%.git}\";\nif [ \"$MODE\" = \"auto\" ]; then\n    if [ -n \"$ACCESS_TOKEN\" ]; then MODE=token; elif [ -f \"$KEY\" ]; then MODE=deploy_key; else MODE=none; fi;\nfi;\ncase \"$MODE\" in token|deploy_key|none) ;; *) echo -e \"[ERROR] GIT_AUTH must be auto, token, deploy_key or none\"; exit 1;; esac;\nif [ \"$MODE\" = \"deploy_key\" ]; then\n    REMOTE=\"git@$GHOST:$GPATH.git\";\n    mkdir -p \/home\/container\/.ssh && chmod 700 \/home\/container\/.ssh;\n    if [ ! -f \"$KEY\" ]; then\n        ssh-keygen -q -t ed25519 -N \"\" -C \"pelican-${P_SERVER_UUID:-$HOSTNAME}\" -f \"$KEY\" || { echo -e \"[ERROR] ssh-keygen failed\"; exit 1; };\n        echo -e \"[SETUP] New deploy key generated. Add this public key as a READ-ONLY deploy key to $GHOST\/$GPATH, then restart:\";\n        cat \"$KEY.pub\";\n    fi;\n    if [ \"$GHOST\" = \"github.com\" ]; then\n        echo \"github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\" > \/home\/container\/.ssh\/known_hosts; HKC=yes;\n    else\n        HKC=accept-new;\n    fi;\n    export GIT_SSH_COMMAND=\"ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=\/home\/container\/.ssh\/known_hosts -o StrictHostKeyChecking=$HKC\";\nelse\n    REMOTE=\"https:\/\/$GHOST\/$GPATH.git\";\nfi;\nif [ \"$MODE\" = \"token\" ]; then\n    GIT_B64=$(printf '%s:%s' \"${USERNAME:-x-access-token}\" \"$ACCESS_TOKEN\" | base64 | tr -d '\\n');\nfi;\ng() { if [ \"$MODE\" = \"token\" ]; then git -c \"http.extraHeader=Authorization: Basic $GIT_B64\" \"$@\"; else git \"$@\"; fi; };\nUPDATED=0;\nif [ -d \"$REPO_DIR\/.git\" ]; then\n    git -C \"$REPO_DIR\" remote set-url origin \"$REMOTE\";\n    if [ \"${AUTO_UPDATE:-true}\" = \"true\" ]; then\n        echo -e \"[SETUP] Updating the repository ($MODE)\";\n        if g -C \"$REPO_DIR\" fetch --prune --tags origin && git -C \"$REPO_DIR\" reset --hard \"${DEPLOY_REF:-origin\/$BR}\"; then UPDATED=1; else echo -e \"[WARN] git fetch failed - keeping the code already present\"; fi;\n    else\n        echo -e \"[SETUP] AUTO_UPDATE=false - keeping the code already present ($(git -C \"$REPO_DIR\" rev-parse --short HEAD))\";\n    fi;\nelse\n    rm -rf \"$REPO_DIR\";\n    echo -e \"[SETUP] Cloning the repository ($MODE)\";\n    if g clone -b \"$BR\" \"$REMOTE\" \"$REPO_DIR\"; then\n        UPDATED=1;\n        if [ -n \"$DEPLOY_REF\" ]; then git -C \"$REPO_DIR\" reset --hard \"$DEPLOY_REF\"; fi;\n    else\n        rm -rf \"$REPO_DIR\"; echo -e \"[WARN] Clone failed - check GITHUB_REPO_URL, BRANCH and the access method ($MODE)\";\n    fi;\nfi;\nunset ACCESS_TOKEN GIT_B64;\nif [ -f \"$REPO_DIR\/pom.xml\" ] && { [ \"$UPDATED\" = \"1\" ] || [ ! -f \"\/home\/container\/$RUN_FILE\" ]; }; then\n    echo -e \"[SETUP] Building with Maven\";\n    if (cd \"$REPO_DIR\" && mvn clean package -Dfile.encoding=UTF-8) && cp \"$REPO_DIR\/target\/$RUN_FILE\" \"\/home\/container\/$RUN_FILE\"; then\n        echo -e \"[SETUP] Copied $RUN_FILE to \/home\/container\/\";\n    else\n        echo -e \"[WARN] Maven build failed - starting the last built $RUN_FILE if present\";\n    fi;\nfi;\nif [ ! -f \"\/home\/container\/$RUN_FILE\" ]; then\n    echo -e \"[ERROR] \/home\/container\/$RUN_FILE not found and no build possible\"; exit 1;\nfi;\ncd \/home\/container;\njava -Dterminal.jline=false -Dterminal.ansi=true -jar \"\/home\/container\/$RUN_FILE\" 2>&1 | tee logs\/latest.log",
     "config": {
         "files": "{}",
         "startup": "{\r\n    \"done\": \"Java application started successfully\"\r\n}",
@@ -80,7 +80,7 @@
         },
         {
             "name": "Git Username",
-            "description": "Username for accessing the GitHub repository.",
+            "description": "Username for HTTPS access. Optional for GitHub tokens.",
             "env_variable": "USERNAME",
             "default_value": "",
             "user_viewable": true,
@@ -90,12 +90,42 @@
         },
         {
             "name": "Git Access Token",
-            "description": "Access token for accessing the GitHub repository.",
+            "description": "Token for HTTPS access (GIT_AUTH=token or auto). Prefer a fine-grained, read-only token. Leave empty for public repositories or deploy keys.",
             "env_variable": "ACCESS_TOKEN",
             "default_value": "",
             "user_viewable": true,
             "user_editable": true,
             "rules": "nullable|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Git Access Method",
+            "description": "auto (token if set, else deploy key if present, else anonymous), token, deploy_key (SSH key generated on first start, add its public key as a read-only deploy key) or none (public repository).",
+            "env_variable": "GIT_AUTH",
+            "default_value": "auto",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:auto,token,deploy_key,none",
+            "field_type": "text"
+        },
+        {
+            "name": "Auto Update",
+            "description": "true: fetch, reset to the branch (or DEPLOY_REF) and rebuild on every start. false: start the JAR already built.",
+            "env_variable": "AUTO_UPDATE",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Deploy Ref",
+            "description": "Optional tag or commit to deploy instead of the head of the branch, e.g. v1.4.0.",
+            "env_variable": "DEPLOY_REF",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:200",
             "field_type": "text"
         }
     ]
